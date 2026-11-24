@@ -1,11 +1,20 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, Address, Env, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, Address, BytesN, Env,
+    Symbol, Vec,
 };
 
 const PRICE_SCALE: i128 = 1_000_000;
 const POW_SCALE: i128 = 1_000_000_000_000;
+const EVENT_SCHEMA_VERSION: u32 = 1;
+
+macro_rules! emit_versioned_event {
+    ($env:expr, $topic:expr, $payload:expr) => {{
+        $env.events()
+            .publish($topic, (EVENT_SCHEMA_VERSION, $payload));
+    }};
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,6 +27,8 @@ pub enum AdapterMode {
 #[derive(Clone)]
 enum DataKey {
     Admin,
+    PendingAdmin,
+    Paused,
     Factory,
     Consumer,
     Mode,
@@ -126,6 +137,14 @@ impl OracleTwapAdapter {
         token_b: Address,
     ) -> Result<(i128, u64), AdapterError> {
         let factory: Address = Self::read(&env, DataKey::Factory)?;
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(AdapterError::Paused);
+        }
         let consumer: Address = Self::read(&env, DataKey::Consumer)?;
         let mode: AdapterMode = Self::read(&env, DataKey::Mode)?;
         let window: u64 = Self::read(&env, DataKey::Window)?;
@@ -217,6 +236,162 @@ impl OracleTwapAdapter {
             Self::read(&env, DataKey::Window)?,
             Self::read(&env, DataKey::MaxAge)?,
         ))
+    }
+
+    pub fn get_fee_tiers(env: Env) -> Result<Vec<i128>, AdapterError> {
+        Self::read(&env, DataKey::FeeTiers)
+    }
+
+    pub fn get_admin(env: Env) -> Result<Address, AdapterError> {
+        Self::read(&env, DataKey::Admin)
+    }
+
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Nominate a new admin. Admin-only; the nominee must separately authorize `accept_admin`.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), AdapterError> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        emit_versioned_event!(&env, (Symbol::new(&env, "admin_proposed"),), (new_admin,));
+        Ok(())
+    }
+
+    /// Complete a two-step admin rotation started by `propose_admin`.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), AdapterError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(AdapterError::NoPendingAdmin)?;
+        if new_admin != pending {
+            return Err(AdapterError::WrongPendingAdmin);
+        }
+        new_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        emit_versioned_event!(&env, (Symbol::new(&env, "admin_changed"),), (new_admin,));
+        Ok(())
+    }
+
+    /// Update the factory contract address. Admin-only.
+    pub fn set_factory(env: Env, factory: Address) -> Result<(), AdapterError> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Factory, &factory);
+        emit_versioned_event!(&env, (Symbol::new(&env, "factory_updated"),), (factory,));
+        Ok(())
+    }
+
+    /// Update the TWAP consumer contract address. Admin-only.
+    pub fn set_consumer(env: Env, consumer: Address) -> Result<(), AdapterError> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Consumer, &consumer);
+        emit_versioned_event!(&env, (Symbol::new(&env, "consumer_updated"),), (consumer,));
+        Ok(())
+    }
+
+    /// Update the adapter mode. Switching to `ConcentratedLiquidity` requires non-empty `fee_tiers`. Admin-only.
+    pub fn set_mode(env: Env, mode: AdapterMode) -> Result<(), AdapterError> {
+        Self::require_admin(&env)?;
+        if mode == AdapterMode::ConcentratedLiquidity {
+            let tiers: Vec<i128> = Self::read(&env, DataKey::FeeTiers)?;
+            if tiers.is_empty() {
+                return Err(AdapterError::InvalidConfiguration);
+            }
+        }
+        env.storage().instance().set(&DataKey::Mode, &mode);
+        emit_versioned_event!(&env, (Symbol::new(&env, "mode_updated"),), (mode,));
+        Ok(())
+    }
+
+    /// Update the TWAP window in seconds. Must be non-zero. Admin-only.
+    pub fn set_window(env: Env, window_seconds: u64) -> Result<(), AdapterError> {
+        Self::require_admin(&env)?;
+        if window_seconds == 0 {
+            return Err(AdapterError::InvalidConfiguration);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Window, &window_seconds);
+        emit_versioned_event!(
+            &env,
+            (Symbol::new(&env, "window_updated"),),
+            (window_seconds,)
+        );
+        Ok(())
+    }
+
+    /// Update the maximum snapshot age in seconds. Must be non-zero. Admin-only.
+    pub fn set_max_age(env: Env, max_age_seconds: u64) -> Result<(), AdapterError> {
+        Self::require_admin(&env)?;
+        if max_age_seconds == 0 {
+            return Err(AdapterError::InvalidConfiguration);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxAge, &max_age_seconds);
+        emit_versioned_event!(
+            &env,
+            (Symbol::new(&env, "max_age_updated"),),
+            (max_age_seconds,)
+        );
+        Ok(())
+    }
+
+    /// Update the CL fee tiers. Must be non-empty when mode is `ConcentratedLiquidity`. Admin-only.
+    pub fn set_fee_tiers(env: Env, fee_tiers: Vec<i128>) -> Result<(), AdapterError> {
+        Self::require_admin(&env)?;
+        let mode: AdapterMode = Self::read(&env, DataKey::Mode)?;
+        if mode == AdapterMode::ConcentratedLiquidity && fee_tiers.is_empty() {
+            return Err(AdapterError::InvalidConfiguration);
+        }
+        env.storage().instance().set(&DataKey::FeeTiers, &fee_tiers);
+        emit_versioned_event!(
+            &env,
+            (Symbol::new(&env, "fee_tiers_updated"),),
+            (fee_tiers,)
+        );
+        Ok(())
+    }
+
+    /// Pause quote reads. Admin-only.
+    pub fn pause(env: Env) -> Result<(), AdapterError> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Paused, &true);
+        emit_versioned_event!(&env, (Symbol::new(&env, "paused"),), (true,));
+        Ok(())
+    }
+
+    /// Resume quote reads. Admin-only.
+    pub fn unpause(env: Env) -> Result<(), AdapterError> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Paused, &false);
+        emit_versioned_event!(&env, (Symbol::new(&env, "unpaused"),), (false,));
+        Ok(())
+    }
+
+    /// Replace this contract's WASM. Admin-only; stored config is preserved.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), AdapterError> {
+        Self::require_admin(&env)?;
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        emit_versioned_event!(&env, (Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
+        Ok(())
+    }
+
+    fn require_admin(env: &Env) -> Result<(), AdapterError> {
+        Self::read::<Address>(env, DataKey::Admin)?.require_auth();
+        Ok(())
     }
 
     fn read<T>(env: &Env, key: DataKey) -> Result<T, AdapterError>
