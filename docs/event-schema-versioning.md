@@ -711,6 +711,8 @@ count. Events marked unversioned carry their payload without the
 | `approve` | 3 | `token_id` | v1 |
 | `approval_for_all` | 3 | `approved` | v1 |
 | `transfer` | 3 | `token_id` | v1 |
+| `accept_transfers_set` | 1 | `accepts` | v1 |
+| `ttl_params_set` | 1 | `min_ttl_threshold`, `bump_to` | v1 |
 
 ### `concentrated_liquidity`
 
